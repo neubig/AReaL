@@ -81,6 +81,336 @@ def _chunked_gather_logprobs_entropy(
     return _chunked_apply(fn, logits, labels, chunk_size)
 
 
+class _FusedLinearLogProbsEntropy(torch.autograd.Function):
+    """Memory-efficient final-linear log-probability and entropy computation.
+
+    This follows the same high-level strategy as verl/Liger fused linear cross
+    entropy kernels, but keeps the implementation in PyTorch for portability:
+    stream the vocabulary projection in chunks, keep only row-wise normalization
+    statistics, and recompute chunks during backward instead of saving logits.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden: torch.Tensor,
+        weight: torch.Tensor,
+        labels: torch.Tensor,
+        bias: torch.Tensor | None,
+        temperature: float,
+        tp_group: dist.ProcessGroup | None,
+        vocab_chunk_size: int,
+        token_chunk_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if hidden.shape[:-1] != labels.shape:
+            raise ValueError(
+                f"labels shape {tuple(labels.shape)} must match hidden leading shape "
+                f"{tuple(hidden.shape[:-1])}"
+            )
+        if hidden.shape[-1] != weight.shape[-1]:
+            raise ValueError(
+                f"hidden size {hidden.shape[-1]} must match weight hidden size "
+                f"{weight.shape[-1]}"
+            )
+        if bias is not None and bias.shape != (weight.shape[0],):
+            raise ValueError(
+                f"bias shape {tuple(bias.shape)} must match local vocab size "
+                f"{weight.shape[0]}"
+            )
+        if temperature <= 0:
+            raise ValueError(f"temperature must be positive, got {temperature}")
+        if vocab_chunk_size <= 0 or token_chunk_size <= 0:
+            raise ValueError(
+                "vocab_chunk_size and token_chunk_size must both be positive"
+            )
+
+        original_shape = labels.shape
+        hidden_2d = hidden.reshape(-1, hidden.shape[-1])
+        labels_1d = labels.reshape(-1)
+        n_rows = hidden_2d.shape[0]
+        local_vocab_size = weight.shape[0]
+        compute_dtype = (
+            torch.float32
+            if hidden.dtype in (torch.float16, torch.bfloat16)
+            else hidden.dtype
+        )
+        inv_temperature = 1.0 / float(temperature)
+
+        if tp_group is not None and dist.get_world_size(tp_group) > 1:
+            tp_rank = dist.get_rank(tp_group)
+            vocab_start = tp_rank * local_vocab_size
+        else:
+            vocab_start = 0
+
+        logprobs = torch.empty(n_rows, device=hidden.device, dtype=compute_dtype)
+        entropy = torch.empty(n_rows, device=hidden.device, dtype=compute_dtype)
+        log_z = torch.empty(n_rows, device=hidden.device, dtype=compute_dtype)
+        mean_logits = torch.empty(n_rows, device=hidden.device, dtype=compute_dtype)
+
+        with torch.no_grad():
+            for token_start in range(0, n_rows, token_chunk_size):
+                token_end = min(token_start + token_chunk_size, n_rows)
+                hidden_chunk = hidden_2d[token_start:token_end]
+                labels_chunk = labels_1d[token_start:token_end]
+                chunk_rows = token_end - token_start
+
+                row_max = torch.full(
+                    (chunk_rows,),
+                    -float("inf"),
+                    device=hidden.device,
+                    dtype=compute_dtype,
+                )
+                sum_exp = torch.zeros(
+                    chunk_rows, device=hidden.device, dtype=compute_dtype
+                )
+                sum_exp_logits = torch.zeros_like(sum_exp)
+                selected_logits = torch.zeros_like(sum_exp)
+                row_idx = torch.arange(chunk_rows, device=hidden.device)
+
+                for vocab_start_local in range(0, local_vocab_size, vocab_chunk_size):
+                    vocab_end_local = min(
+                        vocab_start_local + vocab_chunk_size, local_vocab_size
+                    )
+                    weight_chunk = weight[vocab_start_local:vocab_end_local]
+                    logits_chunk = (
+                        hidden_chunk.to(compute_dtype)
+                        @ weight_chunk.to(compute_dtype).t()
+                    )
+                    if bias is not None:
+                        logits_chunk = logits_chunk + bias[
+                            vocab_start_local:vocab_end_local
+                        ].to(compute_dtype)
+                    logits_chunk = logits_chunk * inv_temperature
+
+                    chunk_max = logits_chunk.amax(dim=-1)
+                    new_max = torch.maximum(row_max, chunk_max)
+                    old_scale = torch.exp(row_max - new_max)
+                    exp_logits = torch.exp(logits_chunk - new_max.unsqueeze(-1))
+                    sum_exp = sum_exp * old_scale + exp_logits.sum(dim=-1)
+                    sum_exp_logits = sum_exp_logits * old_scale + (
+                        exp_logits * logits_chunk
+                    ).sum(dim=-1)
+                    row_max = new_max
+
+                    global_start = vocab_start + vocab_start_local
+                    global_end = vocab_start + vocab_end_local
+                    in_chunk = (labels_chunk >= global_start) & (
+                        labels_chunk < global_end
+                    )
+                    local_idx = torch.clamp(
+                        labels_chunk - global_start,
+                        min=0,
+                        max=vocab_end_local - vocab_start_local - 1,
+                    )
+                    selected_logits = selected_logits + (
+                        logits_chunk[row_idx, local_idx] * in_chunk.to(compute_dtype)
+                    )
+
+                if tp_group is not None and dist.get_world_size(tp_group) > 1:
+                    global_max = row_max.clone()
+                    dist.all_reduce(global_max, op=dist.ReduceOp.MAX, group=tp_group)
+                    rescale = torch.exp(row_max - global_max)
+                    sum_exp = sum_exp * rescale
+                    sum_exp_logits = sum_exp_logits * rescale
+                    dist.all_reduce(sum_exp, op=dist.ReduceOp.SUM, group=tp_group)
+                    dist.all_reduce(
+                        sum_exp_logits, op=dist.ReduceOp.SUM, group=tp_group
+                    )
+                    dist.all_reduce(
+                        selected_logits, op=dist.ReduceOp.SUM, group=tp_group
+                    )
+                    row_max = global_max
+
+                log_z_chunk = row_max + torch.log(sum_exp)
+                mean_logits_chunk = sum_exp_logits / sum_exp
+                log_z[token_start:token_end] = log_z_chunk
+                mean_logits[token_start:token_end] = mean_logits_chunk
+                logprobs[token_start:token_end] = selected_logits - log_z_chunk
+                entropy[token_start:token_end] = log_z_chunk - mean_logits_chunk
+
+        bias_to_save = bias if bias is not None else hidden.new_empty((0,))
+        ctx.save_for_backward(hidden, weight, labels, bias_to_save, log_z, mean_logits)
+        ctx.has_bias = bias is not None
+        ctx.temperature = float(temperature)
+        ctx.tp_group = tp_group
+        ctx.vocab_chunk_size = int(vocab_chunk_size)
+        ctx.token_chunk_size = int(token_chunk_size)
+        ctx.original_shape = original_shape
+
+        return logprobs.reshape(original_shape), entropy.reshape(original_shape)
+
+    @staticmethod
+    def backward(
+        ctx, grad_logprobs: torch.Tensor, grad_entropy: torch.Tensor
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        None,
+        torch.Tensor | None,
+        None,
+        None,
+        None,
+        None,
+    ]:
+        hidden, weight, labels, bias, log_z, mean_logits = ctx.saved_tensors
+        hidden_2d = hidden.reshape(-1, hidden.shape[-1])
+        labels_1d = labels.reshape(-1)
+        compute_dtype = (
+            torch.float32
+            if hidden.dtype in (torch.float16, torch.bfloat16)
+            else hidden.dtype
+        )
+        grad_logprobs_1d = grad_logprobs.reshape(-1).to(compute_dtype)
+        grad_entropy_1d = grad_entropy.reshape(-1).to(compute_dtype)
+        log_z = log_z.to(compute_dtype)
+        mean_logits = mean_logits.to(compute_dtype)
+
+        n_rows = hidden_2d.shape[0]
+        local_vocab_size = weight.shape[0]
+        inv_temperature = 1.0 / ctx.temperature
+        has_bias = ctx.has_bias
+        bias_tensor = bias if has_bias else None
+
+        if ctx.tp_group is not None and dist.get_world_size(ctx.tp_group) > 1:
+            tp_rank = dist.get_rank(ctx.tp_group)
+            vocab_start = tp_rank * local_vocab_size
+        else:
+            vocab_start = 0
+
+        grad_hidden = (
+            torch.zeros_like(hidden_2d, dtype=compute_dtype)
+            if ctx.needs_input_grad[0]
+            else None
+        )
+        grad_weight = (
+            torch.zeros_like(weight, dtype=compute_dtype)
+            if ctx.needs_input_grad[1]
+            else None
+        )
+        grad_bias = (
+            torch.zeros(local_vocab_size, device=weight.device, dtype=compute_dtype)
+            if has_bias and ctx.needs_input_grad[3]
+            else None
+        )
+
+        for token_start in range(0, n_rows, ctx.token_chunk_size):
+            token_end = min(token_start + ctx.token_chunk_size, n_rows)
+            hidden_chunk = hidden_2d[token_start:token_end]
+            labels_chunk = labels_1d[token_start:token_end]
+            grad_logprobs_chunk = grad_logprobs_1d[token_start:token_end]
+            grad_entropy_chunk = grad_entropy_1d[token_start:token_end]
+            log_z_chunk = log_z[token_start:token_end]
+            mean_logits_chunk = mean_logits[token_start:token_end]
+            chunk_rows = token_end - token_start
+            row_idx = torch.arange(chunk_rows, device=hidden.device)
+
+            for vocab_start_local in range(0, local_vocab_size, ctx.vocab_chunk_size):
+                vocab_end_local = min(
+                    vocab_start_local + ctx.vocab_chunk_size, local_vocab_size
+                )
+                weight_chunk = weight[vocab_start_local:vocab_end_local]
+                logits_chunk = (
+                    hidden_chunk.to(compute_dtype) @ weight_chunk.to(compute_dtype).t()
+                )
+                if bias_tensor is not None:
+                    logits_chunk = logits_chunk + bias_tensor[
+                        vocab_start_local:vocab_end_local
+                    ].to(compute_dtype)
+                logits_chunk = logits_chunk * inv_temperature
+                probs = torch.exp(logits_chunk - log_z_chunk.unsqueeze(-1))
+
+                grad_logits = -grad_logprobs_chunk.unsqueeze(-1) * probs
+                grad_logits = grad_logits + grad_entropy_chunk.unsqueeze(-1) * probs * (
+                    mean_logits_chunk.unsqueeze(-1) - logits_chunk
+                )
+
+                global_start = vocab_start + vocab_start_local
+                global_end = vocab_start + vocab_end_local
+                in_chunk = (labels_chunk >= global_start) & (labels_chunk < global_end)
+                local_idx = torch.clamp(
+                    labels_chunk - global_start,
+                    min=0,
+                    max=vocab_end_local - vocab_start_local - 1,
+                )
+                grad_logits[row_idx, local_idx] += grad_logprobs_chunk * in_chunk.to(
+                    grad_logits.dtype
+                )
+
+                grad_logits = grad_logits * inv_temperature
+
+                if grad_hidden is not None:
+                    grad_hidden[token_start:token_end].add_(
+                        grad_logits @ weight_chunk.to(compute_dtype)
+                    )
+                if grad_weight is not None:
+                    grad_weight[vocab_start_local:vocab_end_local].add_(
+                        grad_logits.t() @ hidden_chunk.to(compute_dtype)
+                    )
+                if grad_bias is not None:
+                    grad_bias[vocab_start_local:vocab_end_local].add_(
+                        grad_logits.sum(dim=0)
+                    )
+
+        if grad_hidden is not None and ctx.tp_group is not None:
+            if dist.get_world_size(ctx.tp_group) > 1:
+                dist.all_reduce(grad_hidden, op=dist.ReduceOp.SUM, group=ctx.tp_group)
+
+        return (
+            grad_hidden.reshape_as(hidden).to(hidden.dtype)
+            if grad_hidden is not None
+            else None,
+            grad_weight.to(weight.dtype) if grad_weight is not None else None,
+            None,
+            grad_bias.to(bias.dtype) if grad_bias is not None else None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def fused_linear_logprobs_entropy(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    labels: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    temperature: float = 1.0,
+    tp_group: dist.ProcessGroup | None = None,
+    vocab_chunk_size: int = 4096,
+    token_chunk_size: int = 1024,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute selected-token logprobs and entropy without materializing logits.
+
+    Args:
+        hidden: Final hidden states with shape ``[..., hidden_size]``.
+        weight: Local lm-head weight with shape ``[vocab_size, hidden_size]`` or
+            ``[vocab_size / tp_size, hidden_size]`` when ``tp_group`` is set.
+        labels: Global token ids with shape matching ``hidden.shape[:-1]``.
+        bias: Optional local lm-head bias.
+        temperature: Positive softmax temperature.
+        tp_group: Optional tensor-parallel group over vocabulary shards.
+        vocab_chunk_size: Maximum local vocabulary columns projected at once.
+        token_chunk_size: Maximum flattened tokens projected at once.
+
+    Returns:
+        A tuple of ``(logprobs, entropy)`` with shape ``labels.shape``.
+
+    The function trades extra recomputation in backward for lower activation
+    memory: peak logits memory is bounded by
+    ``token_chunk_size * vocab_chunk_size`` instead of ``num_tokens * vocab``.
+    """
+    return _FusedLinearLogProbsEntropy.apply(
+        hidden,
+        weight,
+        labels,
+        bias,
+        float(temperature),
+        tp_group,
+        int(vocab_chunk_size),
+        int(token_chunk_size),
+    )
+
+
 class _VocabParallelLogProbs(torch.autograd.Function):
     """Compute log probabilities when logits are sharded on the vocab dimension.
 

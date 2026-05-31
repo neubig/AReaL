@@ -7,6 +7,7 @@ from areal.infra.platforms import current_platform
 from areal.utils.functional.vocab_parallel import (
     _vocab_parallel_logprobs,
     _vocab_parallel_logprobs_entropy,
+    fused_linear_logprobs_entropy,
 )
 
 
@@ -372,6 +373,85 @@ def test_vocab_parallel_different_shapes():
         print("✓ test_vocab_parallel_different_shapes passed")
 
 
+def test_fused_linear_logprobs_entropy_vocab_parallel():
+    """Test fused hidden-to-vocab logprobs/entropy with TP-sharded weights."""
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = current_platform.current_device()
+
+    batch_size, seq_len, hidden_size, vocab_size = 2, 4, 16, 128
+    partition_size = vocab_size // world_size
+
+    torch.manual_seed(2026)
+    full_hidden = torch.randn(
+        batch_size, seq_len, hidden_size, device=device, requires_grad=True
+    )
+    full_weight = torch.randn(
+        vocab_size, hidden_size, device=device, requires_grad=True
+    )
+    full_bias = torch.randn(vocab_size, device=device, requires_grad=True)
+    labels = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+
+    start_idx = rank * partition_size
+    end_idx = start_idx + partition_size
+    hidden = full_hidden.detach().clone().requires_grad_(True)
+    local_weight = full_weight.detach()[start_idx:end_idx].clone().requires_grad_(True)
+    local_bias = full_bias.detach()[start_idx:end_idx].clone().requires_grad_(True)
+
+    logprobs, entropy = fused_linear_logprobs_entropy(
+        hidden,
+        local_weight,
+        labels,
+        bias=local_bias,
+        temperature=0.8,
+        tp_group=get_tp_group(),
+        vocab_chunk_size=17,
+        token_chunk_size=3,
+    )
+    loss = (logprobs + 0.25 * entropy).sum()
+    loss.backward()
+
+    ref_logprobs, ref_entropy = reference_logprobs_entropy(
+        full_hidden @ full_weight.t() / 0.8 + full_bias / 0.8,
+        labels,
+    )
+    ref_loss = (ref_logprobs + 0.25 * ref_entropy).sum()
+    ref_loss.backward()
+
+    if not torch.allclose(logprobs, ref_logprobs, atol=1e-5, rtol=1e-5):
+        max_diff = (logprobs - ref_logprobs).abs().max().item()
+        raise ValueError(f"[Rank {rank}] fused logprobs mismatch! Max diff: {max_diff}")
+    if not torch.allclose(entropy, ref_entropy, atol=1e-5, rtol=1e-5):
+        max_diff = (entropy - ref_entropy).abs().max().item()
+        raise ValueError(f"[Rank {rank}] fused entropy mismatch! Max diff: {max_diff}")
+    if not torch.allclose(hidden.grad, full_hidden.grad, atol=1e-5, rtol=1e-5):
+        max_diff = (hidden.grad - full_hidden.grad).abs().max().item()
+        raise ValueError(
+            f"[Rank {rank}] fused hidden grad mismatch! Max diff: {max_diff}"
+        )
+    if not torch.allclose(
+        local_weight.grad, full_weight.grad[start_idx:end_idx], atol=1e-5, rtol=1e-5
+    ):
+        max_diff = (
+            (local_weight.grad - full_weight.grad[start_idx:end_idx]).abs().max().item()
+        )
+        raise ValueError(
+            f"[Rank {rank}] fused weight grad mismatch! Max diff: {max_diff}"
+        )
+    if not torch.allclose(
+        local_bias.grad, full_bias.grad[start_idx:end_idx], atol=1e-5, rtol=1e-5
+    ):
+        max_diff = (
+            (local_bias.grad - full_bias.grad[start_idx:end_idx]).abs().max().item()
+        )
+        raise ValueError(
+            f"[Rank {rank}] fused bias grad mismatch! Max diff: {max_diff}"
+        )
+
+    if rank == 0:
+        print("✓ test_fused_linear_logprobs_entropy_vocab_parallel passed")
+
+
 def run_all_tests():
     """Run all tensor parallel tests."""
     rank = dist.get_rank()
@@ -401,6 +481,9 @@ def run_all_tests():
     dist.barrier()
 
     test_vocab_parallel_different_shapes()
+    dist.barrier()
+
+    test_fused_linear_logprobs_entropy_vocab_parallel()
     dist.barrier()
 
     if rank == 0:

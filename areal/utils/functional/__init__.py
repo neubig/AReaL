@@ -12,6 +12,7 @@ from areal.utils.functional.functional import (
     sapo_loss_fn,
 )
 from areal.utils.functional.vocab_parallel import (
+    fused_linear_logprobs_entropy,
     gather_logprobs,
     gather_logprobs_entropy,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "reward_overlong_penalty",
     "sapo_loss_fn",
     # vocab_parallel.py
+    "fused_linear_logprobs_entropy",
     "gather_logprobs",
     "gather_logprobs_entropy",
 ]
